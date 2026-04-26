@@ -1,4 +1,8 @@
+mod actions;
 mod cache;
+mod dedup;
+mod plan;
+mod report;
 mod walker;
 
 fn main() -> anyhow::Result<()> {
@@ -13,9 +17,28 @@ fn main() -> anyhow::Result<()> {
     };
 
     let entries = walker::walk(&opts)?;
-    println!("found {} files", entries.len());
-    for e in &entries {
-        println!("{:>10}  {}", e.size, e.path.display());
+    println!("scanned {} files", entries.len());
+
+    let cache = cache::Cache::open()?;
+    let groups = dedup::find_duplicates(&entries, Some(&cache))?;
+
+    let mut total_reclaim: u64 = 0;
+    for g in &groups {
+        total_reclaim += g.reclaimable_bytes();
+        println!(
+            "\nduplicate group ({} files, reclaim {} bytes)",
+            g.files.len(),
+            g.reclaimable_bytes()
+        );
+        println!("  keep:  {}", g.keep.display());
+        for t in &g.trash {
+            println!("  trash: {}", t.display());
+        }
     }
+    println!(
+        "\n{} duplicate groups, {} bytes reclaimable",
+        groups.len(),
+        total_reclaim
+    );
     Ok(())
 }
