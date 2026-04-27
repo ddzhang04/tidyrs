@@ -30,6 +30,10 @@ impl Default for WalkOpts {
 }
 
 pub fn walk(opts: &WalkOpts) -> Result<Vec<FileEntry>> {
+    walk_with(opts, |_| {})
+}
+
+pub fn walk_with(opts: &WalkOpts, mut on_progress: impl FnMut(usize)) -> Result<Vec<FileEntry>> {
     let root = opts
         .root
         .canonicalize()
@@ -43,6 +47,8 @@ pub fn walk(opts: &WalkOpts) -> Result<Vec<FileEntry>> {
         .git_ignore(opts.use_gitignore)
         .git_global(opts.use_gitignore)
         .git_exclude(opts.use_gitignore)
+        .require_git(false)
+        .parents(true)
         .follow_links(false)
         .filter_entry(|e| e.file_name() != ".git")
         .build();
@@ -89,7 +95,11 @@ pub fn walk(opts: &WalkOpts) -> Result<Vec<FileEntry>> {
         };
 
         out.push(FileEntry { path, size, mtime });
+        if out.len() % 500 == 0 {
+            on_progress(out.len());
+        }
     }
+    on_progress(out.len());
 
     Ok(out)
 }
@@ -170,6 +180,30 @@ mod tests {
         let entries = walk(&o).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].path.ends_with("real.txt"));
+    }
+
+    #[test]
+    fn respects_nested_gitignore_outside_git_repo() {
+        // Simulate ~/Downloads/some-project/{.gitignore, target/build.bin}
+        // The outer dir is NOT a git repo, but the project's .gitignore
+        // should still cause `target/` to be skipped.
+        let d = TempDir::new().unwrap();
+        write(&d, "project/.gitignore", b"target/\n");
+        write(&d, "project/src/main.rs", &vec![0u8; 2048]);
+        write(&d, "project/target/build.bin", &vec![0u8; 2048]);
+
+        let mut o = opts(&d);
+        o.use_gitignore = true;
+        let entries = walk(&o).unwrap();
+
+        assert!(
+            entries.iter().any(|e| e.path.ends_with("main.rs")),
+            "main.rs should be found"
+        );
+        assert!(
+            !entries.iter().any(|e| e.path.to_string_lossy().contains("target/")),
+            "target/ should be filtered by nested .gitignore: {entries:?}"
+        );
     }
 
     #[test]

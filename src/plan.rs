@@ -35,7 +35,7 @@ pub enum Action {
     Ignore,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
     pub actions: Vec<Action>,
     pub dry_run: bool,

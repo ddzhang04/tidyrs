@@ -22,26 +22,43 @@ impl DupGroup {
 }
 
 pub fn find_duplicates(entries: &[FileEntry], cache: Option<&Cache>) -> Result<Vec<DupGroup>> {
+    find_duplicates_with(entries, cache, |_, _| {})
+}
+
+pub fn find_duplicates_with(
+    entries: &[FileEntry],
+    cache: Option<&Cache>,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<Vec<DupGroup>> {
     let mut by_size: HashMap<u64, Vec<&FileEntry>> = HashMap::new();
     for e in entries {
         by_size.entry(e.size).or_default().push(e);
     }
 
-    let mut by_hash: HashMap<[u8; 32], Vec<FileEntry>> = HashMap::new();
+    let candidates: Vec<&FileEntry> = by_size
+        .values()
+        .filter(|b| b.len() >= 2)
+        .flat_map(|b| b.iter().copied())
+        .collect();
+    let total = candidates.len();
+    on_progress(0, total);
 
-    for (_, bucket) in by_size {
-        if bucket.len() < 2 {
-            continue;
-        }
-        for entry in bucket {
-            let hash = match hash_with_cache(entry, cache) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("hash error for {}: {e}", entry.path.display());
-                    continue;
-                }
-            };
-            by_hash.entry(hash).or_default().push(entry.clone());
+    let mut by_hash: HashMap<[u8; 32], Vec<FileEntry>> = HashMap::new();
+    let mut done = 0;
+
+    for entry in candidates {
+        let hash = match hash_with_cache(entry, cache) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("hash error for {}: {e}", entry.path.display());
+                done += 1;
+                continue;
+            }
+        };
+        by_hash.entry(hash).or_default().push(entry.clone());
+        done += 1;
+        if done % 50 == 0 || done == total {
+            on_progress(done, total);
         }
     }
 
