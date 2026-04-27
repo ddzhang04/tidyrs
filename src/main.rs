@@ -7,77 +7,60 @@ mod ui;
 mod walker;
 
 use anyhow::Result;
+use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Parser, Debug)]
+#[command(name = "tidy", version, about = "Local-first file organizer")]
+struct Cli {
+    /// Directory to scan
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Allow the TUI to execute plans (otherwise dry-run only)
+    #[arg(long)]
+    execute: bool,
+
+    /// Print a plain report instead of opening the TUI
+    #[arg(long)]
+    plain: bool,
+}
 
 fn main() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let execute_flag = take_flag(&mut args, "--execute");
-    let plain = take_flag(&mut args, "--plain");
+    let cli = Cli::parse();
+    let root = cli.path.clone();
 
-    let root: PathBuf = args
-        .into_iter()
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let opts = walker::WalkOpts {
-        root: root.clone(),
-        ..Default::default()
-    };
-
-    if plain {
-        let entries = walker::walk(&opts)?;
-        eprintln!("scanned {} files", entries.len());
-        let cache = cache::Cache::open()?;
-        let dups = dedup::find_duplicates(&entries, Some(&cache))?;
-        let groups = report::build(dups);
-        if groups.is_empty() {
-            println!("no duplicate groups found");
-        } else {
-            print_plain(&groups);
-        }
-        return Ok(());
+    if cli.plain {
+        return run_plain(&root);
     }
 
-    let cache = cache::Cache::open()?;
-    let scan_opts = opts.clone();
-    let outcome = ui::run_with_scan(execute_flag, move |tx| {
-        let send = |p: ui::Progress| {
-            let _ = tx.send(p);
-        };
-        let walk_tx = tx.clone();
-        let entries = match walker::walk_with(&scan_opts, |n| {
-            let _ = walk_tx.send(ui::Progress::Walked(n));
-        }) {
-            Ok(e) => e,
-            Err(e) => {
-                send(ui::Progress::Error(e.to_string()));
-                return;
-            }
-        };
-        let hash_tx = tx.clone();
-        let mut started = false;
-        let dups = match dedup::find_duplicates_with(&entries, Some(&cache), |done, total| {
-            if !started {
-                let _ = hash_tx.send(ui::Progress::HashStart { total });
-                started = true;
-            }
-            let _ = hash_tx.send(ui::Progress::Hashed { done, total });
-        }) {
-            Ok(d) => d,
-            Err(e) => {
-                send(ui::Progress::Error(e.to_string()));
-                return;
-            }
-        };
-        let groups = report::build(dups);
-        send(ui::Progress::Done(groups));
-    })?;
+    let cache = Arc::new(cache::Cache::open()?);
+    let initial = ui::Settings::default();
+
+    let factory = {
+        let root = root.clone();
+        let cache = cache.clone();
+        move |settings: ui::Settings| {
+            let opts = walker::WalkOpts {
+                root: root.clone(),
+                min_size: settings.min_size,
+                include_hidden: settings.include_hidden,
+                use_gitignore: settings.use_gitignore,
+            };
+            let cache_for_scan = if settings.use_cache {
+                Some(cache.clone())
+            } else {
+                None
+            };
+            spawn_scan(opts, cache_for_scan)
+        }
+    };
+
+    let outcome = ui::run_with_factory(cli.execute, initial, factory)?;
 
     match outcome {
-        ui::UiOutcome::Quit => {
-            println!("quit");
-        }
+        ui::UiOutcome::Quit => println!("quit"),
         ui::UiOutcome::Save(plan) => {
             let path = root.canonicalize()?.join("tidy-plan.json");
             std::fs::write(&path, plan.to_json()?)?;
@@ -96,18 +79,60 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
-    if let Some(pos) = args.iter().position(|a| a == flag) {
-        args.remove(pos);
-        true
-    } else {
-        false
-    }
+fn spawn_scan(
+    opts: walker::WalkOpts,
+    cache: Option<Arc<cache::Cache>>,
+) -> std::sync::mpsc::Receiver<ui::Progress> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let walk_tx = tx.clone();
+        let entries = match walker::walk_with(&opts, |n| {
+            let _ = walk_tx.send(ui::Progress::Walked(n));
+        }) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.send(ui::Progress::Error(e.to_string()));
+                return;
+            }
+        };
+        let cache_ref = cache.as_deref();
+        let hash_tx = tx.clone();
+        let mut started = false;
+        let dups = match dedup::find_duplicates_with(&entries, cache_ref, |done, total| {
+            if !started {
+                let _ = hash_tx.send(ui::Progress::HashStart { total });
+                started = true;
+            }
+            let _ = hash_tx.send(ui::Progress::Hashed { done, total });
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(ui::Progress::Error(e.to_string()));
+                return;
+            }
+        };
+        let groups = report::build(dups);
+        let _ = tx.send(ui::Progress::Done(groups));
+    });
+    rx
 }
 
-fn print_plain(groups: &[plan::Group]) {
+fn run_plain(root: &PathBuf) -> Result<()> {
+    let opts = walker::WalkOpts {
+        root: root.clone(),
+        ..Default::default()
+    };
+    let entries = walker::walk(&opts)?;
+    eprintln!("scanned {} files", entries.len());
+    let cache = cache::Cache::open()?;
+    let dups = dedup::find_duplicates(&entries, Some(&cache))?;
+    let groups = report::build(dups);
+    if groups.is_empty() {
+        println!("no duplicate groups found");
+        return Ok(());
+    }
     let mut total: u64 = 0;
-    for g in groups {
+    for g in &groups {
         let bytes = report::reclaimable_bytes(g);
         total += bytes;
         println!(
@@ -121,4 +146,5 @@ fn print_plain(groups: &[plan::Group]) {
         }
     }
     println!("\n{} groups, {} bytes total reclaimable", groups.len(), total);
+    Ok(())
 }

@@ -36,7 +36,55 @@ struct ScanState {
 enum Mode {
     Scanning(ScanState),
     Browsing,
+    Settings(SettingsForm),
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub min_size: u64,
+    pub include_hidden: bool,
+    pub use_gitignore: bool,
+    pub use_cache: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            min_size: 1024,
+            include_hidden: false,
+            use_gitignore: true,
+            use_cache: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsForm {
+    settings: Settings,
+    cursor: usize,
+    min_size_buffer: String,
+}
+
+impl SettingsForm {
+    fn new(s: Settings) -> Self {
+        let buf = s.min_size.to_string();
+        Self {
+            settings: s,
+            cursor: 0,
+            min_size_buffer: buf,
+        }
+    }
+    fn rows() -> usize {
+        4
+    }
+    fn commit_min_size(&mut self) {
+        if let Ok(n) = self.min_size_buffer.parse::<u64>() {
+            self.settings.min_size = n;
+        } else {
+            self.min_size_buffer = self.settings.min_size.to_string();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +118,8 @@ pub struct App {
     execute_allowed: bool,
     confirm_execute: bool,
     mode: Mode,
+    current_settings: Settings,
+    pending_rescan: Option<Settings>,
 }
 
 impl App {
@@ -98,10 +148,16 @@ impl App {
             execute_allowed,
             confirm_execute: false,
             mode: Mode::Browsing,
+            current_settings: Settings::default(),
+            pending_rescan: None,
         }
     }
 
     pub fn empty_scanning(execute_allowed: bool) -> Self {
+        Self::empty_scanning_with(execute_allowed, Settings::default())
+    }
+
+    pub fn empty_scanning_with(execute_allowed: bool, settings: Settings) -> Self {
         Self {
             groups: Vec::new(),
             rows_dup: Vec::new(),
@@ -112,7 +168,13 @@ impl App {
             execute_allowed,
             confirm_execute: false,
             mode: Mode::Scanning(ScanState::default()),
+            current_settings: settings,
+            pending_rescan: None,
         }
+    }
+
+    pub fn take_pending_rescan(&mut self) -> Option<Settings> {
+        self.pending_rescan.take()
     }
 
     pub fn apply_progress(&mut self, p: Progress) {
@@ -220,6 +282,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiOutcome> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+
+        if matches!(self.mode, Mode::Settings(_)) {
+            return self.handle_settings_key(key);
         }
 
         if self.confirm_execute {
@@ -338,11 +404,70 @@ impl App {
                 }
                 None
             }
+            (KeyCode::Char('s'), _) => {
+                self.mode = Mode::Settings(SettingsForm::new(self.current_settings.clone()));
+                None
+            }
             (KeyCode::Char('w'), _) => Some(UiOutcome::Save(self.build_plan(true))),
             (KeyCode::Char('x'), _) => {
                 if self.execute_allowed {
                     self.confirm_execute = true;
                 }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> Option<UiOutcome> {
+        let form = match &mut self.mode {
+            Mode::Settings(f) => f,
+            _ => return None,
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.mode = Mode::Browsing;
+                None
+            }
+            (KeyCode::Char('q'), _) => Some(UiOutcome::Quit),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(UiOutcome::Quit),
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                if form.cursor > 0 {
+                    form.cursor -= 1;
+                }
+                None
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                if form.cursor + 1 < SettingsForm::rows() {
+                    form.cursor += 1;
+                }
+                None
+            }
+            (KeyCode::Char(' '), _) | (KeyCode::Enter, _) => {
+                match form.cursor {
+                    0 => form.settings.include_hidden = !form.settings.include_hidden,
+                    1 => form.settings.use_gitignore = !form.settings.use_gitignore,
+                    2 => form.settings.use_cache = !form.settings.use_cache,
+                    _ => {}
+                }
+                None
+            }
+            (KeyCode::Char(c), _) if c.is_ascii_digit() && form.cursor == 3 => {
+                if form.min_size_buffer.len() < 12 {
+                    form.min_size_buffer.push(c);
+                }
+                None
+            }
+            (KeyCode::Backspace, _) if form.cursor == 3 => {
+                form.min_size_buffer.pop();
+                None
+            }
+            (KeyCode::Char('r'), _) => {
+                form.commit_min_size();
+                let settings = form.settings.clone();
+                self.current_settings = settings.clone();
+                self.pending_rescan = Some(settings);
+                self.mode = Mode::Scanning(ScanState::default());
                 None
             }
             _ => None,
@@ -405,23 +530,27 @@ fn cycle_action(current: &Action, suggested: &Action) -> Action {
     }
 }
 
-pub fn run(groups: Vec<Group>, execute_allowed: bool) -> Result<UiOutcome> {
-    let (tx, rx) = mpsc::channel();
-    tx.send(Progress::Done(groups)).ok();
-    drop(tx);
-    run_loop(App::empty_scanning(execute_allowed), rx)
-}
-
-pub fn run_with_scan<F>(execute_allowed: bool, scan: F) -> Result<UiOutcome>
+pub fn run_with_factory<F>(
+    execute_allowed: bool,
+    initial: Settings,
+    factory: F,
+) -> Result<UiOutcome>
 where
-    F: FnOnce(mpsc::Sender<Progress>) + Send + 'static,
+    F: Fn(Settings) -> mpsc::Receiver<Progress> + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || scan(tx));
-    run_loop(App::empty_scanning(execute_allowed), rx)
+    let mut rx = factory(initial.clone());
+    let app = App::empty_scanning_with(execute_allowed, initial);
+    run_loop(app, &mut rx, factory)
 }
 
-fn run_loop(mut app: App, rx: mpsc::Receiver<Progress>) -> Result<UiOutcome> {
+fn run_loop<F>(
+    mut app: App,
+    rx: &mut mpsc::Receiver<Progress>,
+    factory: F,
+) -> Result<UiOutcome>
+where
+    F: Fn(Settings) -> mpsc::Receiver<Progress>,
+{
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -429,6 +558,9 @@ fn run_loop(mut app: App, rx: mpsc::Receiver<Progress>) -> Result<UiOutcome> {
     let mut terminal = Terminal::new(backend)?;
 
     let outcome = loop {
+        if let Some(settings) = app.take_pending_rescan() {
+            *rx = factory(settings);
+        }
         while let Ok(p) = rx.try_recv() {
             app.apply_progress(p);
         }
@@ -452,9 +584,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     match &app.mode {
         Mode::Scanning(s) => return draw_scanning(f, s),
         Mode::Failed(e) => return draw_failed(f, e),
+        Mode::Settings(form) => {
+            draw_browsing(f, app);
+            draw_settings(f, form);
+            return;
+        }
         Mode::Browsing => {}
     }
+    draw_browsing(f, app);
+}
 
+fn draw_browsing(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -492,7 +632,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let (groups_sel, files_aff, bytes) = app.totals();
     let mode = if app.execute_allowed { "execute" } else { "dry-run" };
     let status = format!(
-        " {} groups • {} files • {:.2} MB reclaimable │ mode: {} │ Tab=switch ↑↓=group J/K=file m=keep o=open a=cycle Space=ignore Enter=expand w=save x=execute q=quit",
+        " {} groups • {} files • {:.2} MB reclaimable │ mode: {} │ Tab=switch ↑↓=group J/K=file m=keep o=open a=cycle Space=ignore s=settings w=save x=execute q=quit",
         groups_sel,
         files_aff,
         bytes as f64 / 1_000_000.0,
@@ -609,6 +749,53 @@ fn group_list_item<'a>(row: &'a Row, group: &'a Group) -> ListItem<'a> {
         }
     }
     ListItem::new(lines)
+}
+
+fn draw_settings(f: &mut ratatui::Frame, form: &SettingsForm) {
+    let area = centered_rect(60, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let s = &form.settings;
+    let row = |i: usize, label: String| -> Line {
+        let marker = if form.cursor == i { "▶ " } else { "  " };
+        let style = if form.cursor == i {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        Line::from(Span::styled(format!("{marker}{label}"), style))
+    };
+
+    let cb = |on: bool| if on { "[x]" } else { "[ ]" };
+    let lines = vec![
+        Line::from(""),
+        row(0, format!("{} include hidden files", cb(s.include_hidden))),
+        row(1, format!("{} respect .gitignore", cb(s.use_gitignore))),
+        row(2, format!("{} use cache this run", cb(s.use_cache))),
+        row(
+            3,
+            format!(
+                "min size: [ {:>10} ] bytes",
+                if form.cursor == 3 {
+                    format!("{}_", form.min_size_buffer)
+                } else {
+                    form.min_size_buffer.clone()
+                }
+            ),
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ↑↓ move • Space toggle • type digits to edit min size",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  r = rescan with these settings • Esc = cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("settings"));
+    f.render_widget(p, area);
 }
 
 fn draw_confirm_modal(f: &mut ratatui::Frame, files: usize, bytes: u64) {
@@ -925,6 +1112,94 @@ mod tests {
             Action::KeepOne { keep, .. } => assert_eq!(keep, &PathBuf::from("/b")),
             _ => panic!("expected KeepOne after m"),
         }
+    }
+
+    #[test]
+    fn s_opens_settings_panel() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        assert!(matches!(app.mode, Mode::Settings(_)));
+    }
+
+    #[test]
+    fn esc_closes_settings_without_rescan() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        app.handle_key(special(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Browsing));
+        assert!(app.take_pending_rescan().is_none());
+    }
+
+    #[test]
+    fn space_toggles_checkbox_in_settings() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        // cursor starts at row 0 (include_hidden), default false
+        app.handle_key(key(' '));
+        if let Mode::Settings(form) = &app.mode {
+            assert!(form.settings.include_hidden);
+        } else {
+            panic!("expected Settings mode");
+        }
+    }
+
+    #[test]
+    fn digits_edit_min_size() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        // move to row 3 (min size)
+        for _ in 0..3 {
+            app.handle_key(special(KeyCode::Down));
+        }
+        // erase default "1024" buffer then type "500"
+        for _ in 0..4 {
+            app.handle_key(special(KeyCode::Backspace));
+        }
+        for c in "500".chars() {
+            app.handle_key(key(c));
+        }
+        if let Mode::Settings(form) = &app.mode {
+            assert_eq!(form.min_size_buffer, "500");
+        } else {
+            panic!("expected Settings mode");
+        }
+    }
+
+    #[test]
+    fn r_triggers_rescan_with_new_settings() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        app.handle_key(key(' ')); // toggle include_hidden on
+        app.handle_key(key('r'));
+        // mode flips to Scanning, pending_rescan is populated with new settings
+        assert!(app.is_scanning());
+        let pending = app.take_pending_rescan().expect("rescan pending");
+        assert!(pending.include_hidden);
+        assert_eq!(pending.min_size, 1024);
+    }
+
+    #[test]
+    fn r_commits_min_size_buffer() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('s'));
+        for _ in 0..3 {
+            app.handle_key(special(KeyCode::Down));
+        }
+        for _ in 0..4 {
+            app.handle_key(special(KeyCode::Backspace));
+        }
+        for c in "8192".chars() {
+            app.handle_key(key(c));
+        }
+        app.handle_key(key('r'));
+        let pending = app.take_pending_rescan().unwrap();
+        assert_eq!(pending.min_size, 8192);
     }
 
     // Suppress dead-code warning on report import in non-test build.
