@@ -98,6 +98,7 @@ pub enum UiOutcome {
 enum Tab {
     Duplicates,
     Clusters,
+    Directories,
 }
 
 #[derive(Debug, Clone)]
@@ -112,9 +113,11 @@ pub struct App {
     groups: Vec<Group>,
     rows_dup: Vec<Row>,
     rows_cluster: Vec<Row>,
+    rows_dir: Vec<Row>,
     tab: Tab,
     selected_dup: usize,
     selected_cluster: usize,
+    selected_dir: usize,
     execute_allowed: bool,
     confirm_execute: bool,
     mode: Mode,
@@ -126,6 +129,7 @@ impl App {
     pub fn new(groups: Vec<Group>, execute_allowed: bool) -> Self {
         let mut rows_dup = Vec::new();
         let mut rows_cluster = Vec::new();
+        let mut rows_dir = Vec::new();
         for (i, g) in groups.iter().enumerate() {
             let row = Row {
                 group_idx: i,
@@ -136,15 +140,18 @@ impl App {
             match g.kind {
                 GroupKind::Duplicate => rows_dup.push(row),
                 GroupKind::NameCluster => rows_cluster.push(row),
+                GroupKind::DuplicateDir => rows_dir.push(row),
             }
         }
         Self {
             groups,
             rows_dup,
             rows_cluster,
+            rows_dir,
             tab: Tab::Duplicates,
             selected_dup: 0,
             selected_cluster: 0,
+            selected_dir: 0,
             execute_allowed,
             confirm_execute: false,
             mode: Mode::Browsing,
@@ -162,9 +169,11 @@ impl App {
             groups: Vec::new(),
             rows_dup: Vec::new(),
             rows_cluster: Vec::new(),
+            rows_dir: Vec::new(),
             tab: Tab::Duplicates,
             selected_dup: 0,
             selected_cluster: 0,
+            selected_dir: 0,
             execute_allowed,
             confirm_execute: false,
             mode: Mode::Scanning(ScanState::default()),
@@ -192,6 +201,7 @@ impl App {
                 self.groups = groups;
                 self.rows_dup.clear();
                 self.rows_cluster.clear();
+                self.rows_dir.clear();
                 for (i, g) in self.groups.iter().enumerate() {
                     let row = Row {
                         group_idx: i,
@@ -202,6 +212,7 @@ impl App {
                     match g.kind {
                         GroupKind::Duplicate => self.rows_dup.push(row),
                         GroupKind::NameCluster => self.rows_cluster.push(row),
+                        GroupKind::DuplicateDir => self.rows_dir.push(row),
                     }
                 }
                 self.mode = Mode::Browsing;
@@ -222,6 +233,7 @@ impl App {
         match self.tab {
             Tab::Duplicates => &self.rows_dup,
             Tab::Clusters => &self.rows_cluster,
+            Tab::Directories => &self.rows_dir,
         }
     }
 
@@ -229,6 +241,7 @@ impl App {
         match self.tab {
             Tab::Duplicates => &mut self.rows_dup,
             Tab::Clusters => &mut self.rows_cluster,
+            Tab::Directories => &mut self.rows_dir,
         }
     }
 
@@ -236,6 +249,7 @@ impl App {
         match self.tab {
             Tab::Duplicates => self.selected_dup,
             Tab::Clusters => self.selected_cluster,
+            Tab::Directories => self.selected_dir,
         }
     }
 
@@ -243,12 +257,18 @@ impl App {
         match self.tab {
             Tab::Duplicates => &mut self.selected_dup,
             Tab::Clusters => &mut self.selected_cluster,
+            Tab::Directories => &mut self.selected_dir,
         }
     }
 
     pub fn build_plan(&self, dry_run: bool) -> Plan {
         let mut actions = Vec::new();
-        for row in self.rows_dup.iter().chain(self.rows_cluster.iter()) {
+        for row in self
+            .rows_dup
+            .iter()
+            .chain(self.rows_cluster.iter())
+            .chain(self.rows_dir.iter())
+        {
             if !matches!(row.chosen, Action::Ignore) {
                 actions.push(row.chosen.clone());
             }
@@ -260,7 +280,12 @@ impl App {
         let mut groups_selected = 0;
         let mut files_affected = 0;
         let mut bytes = 0u64;
-        for row in self.rows_dup.iter().chain(self.rows_cluster.iter()) {
+        for row in self
+            .rows_dup
+            .iter()
+            .chain(self.rows_cluster.iter())
+            .chain(self.rows_dir.iter())
+        {
             match &row.chosen {
                 Action::Ignore => {}
                 Action::KeepOne { trash, .. } => {
@@ -310,7 +335,8 @@ impl App {
             (KeyCode::Tab, _) => {
                 self.tab = match self.tab {
                     Tab::Duplicates => Tab::Clusters,
-                    Tab::Clusters => Tab::Duplicates,
+                    Tab::Clusters => Tab::Directories,
+                    Tab::Directories => Tab::Duplicates,
                 };
                 None
             }
@@ -604,10 +630,11 @@ fn draw_browsing(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    let titles = vec!["Duplicates", "Clusters"];
+    let titles = vec!["Duplicates", "Clusters", "Directories"];
     let selected_tab = match app.tab {
         Tab::Duplicates => 0,
         Tab::Clusters => 1,
+        Tab::Directories => 2,
     };
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title("tidy"))

@@ -1,10 +1,4 @@
-mod actions;
-mod cache;
-mod dedup;
-mod plan;
-mod report;
-mod ui;
-mod walker;
+use tidyrs::{actions, cache, dedup, dirdup, plan, report, ui, walker};
 
 use anyhow::Result;
 use clap::Parser;
@@ -111,7 +105,14 @@ fn spawn_scan(
                 return;
             }
         };
-        let groups = report::build(dups);
+        let dir_dups = match dirdup::find_duplicate_dirs(&opts.root, &entries, cache_ref) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(ui::Progress::Error(e.to_string()));
+                return;
+            }
+        };
+        let groups = report::build(dups, dir_dups);
         let _ = tx.send(ui::Progress::Done(groups));
     });
     rx
@@ -126,7 +127,8 @@ fn run_plain(root: &PathBuf) -> Result<()> {
     eprintln!("scanned {} files", entries.len());
     let cache = cache::Cache::open()?;
     let dups = dedup::find_duplicates(&entries, Some(&cache))?;
-    let groups = report::build(dups);
+    let dir_dups = dirdup::find_duplicate_dirs(root, &entries, Some(&cache))?;
+    let groups = report::build(dups, dir_dups);
     if groups.is_empty() {
         println!("no duplicate groups found");
         return Ok(());

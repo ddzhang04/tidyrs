@@ -75,7 +75,7 @@ pub fn find_duplicates_with(
     Ok(groups)
 }
 
-fn hash_with_cache(entry: &FileEntry, cache: Option<&Cache>) -> Result<[u8; 32]> {
+pub(crate) fn hash_with_cache(entry: &FileEntry, cache: Option<&Cache>) -> Result<[u8; 32]> {
     let key = Key {
         path: &entry.path,
         size: entry.size,

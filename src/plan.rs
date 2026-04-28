@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum GroupKind {
     Duplicate,
     NameCluster,
+    DuplicateDir,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

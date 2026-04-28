@@ -1,10 +1,34 @@
 use crate::dedup::DupGroup;
+use crate::dirdup::DirDup;
 use crate::plan::{Action, Group, GroupFile, GroupKind};
 
-pub fn build(dups: Vec<DupGroup>) -> Vec<Group> {
+pub fn build(dups: Vec<DupGroup>, dir_dups: Vec<DirDup>) -> Vec<Group> {
     let mut groups: Vec<Group> = dups.into_iter().map(dup_to_group).collect();
+    groups.extend(dir_dups.into_iter().map(dirdup_to_group));
     groups.sort_by_key(|g| std::cmp::Reverse(reclaimable_bytes(g)));
     groups
+}
+
+fn dirdup_to_group(d: DirDup) -> Group {
+    let label = format!("dir:{}", short_hash(&d.hash));
+    let suggested = Action::KeepOne {
+        keep: d.keep.clone(),
+        trash: d.trash.clone(),
+    };
+    let files = d
+        .dirs
+        .iter()
+        .map(|de| GroupFile {
+            path: de.path.clone(),
+            size: de.total_size,
+        })
+        .collect();
+    Group {
+        kind: GroupKind::DuplicateDir,
+        files,
+        label,
+        suggested,
+    }
 }
 
 fn dup_to_group(d: DupGroup) -> Group {
@@ -74,7 +98,7 @@ mod tests {
 
     #[test]
     fn dup_group_becomes_duplicate_kind() {
-        let groups = build(vec![dup(0xab, 100, vec!["/a/x.txt", "/a/y.txt"])]);
+        let groups = build(vec![dup(0xab, 100, vec!["/a/x.txt", "/a/y.txt"])], vec![]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, GroupKind::Duplicate);
         assert!(groups[0].label.starts_with("hash:"));
@@ -83,7 +107,7 @@ mod tests {
 
     #[test]
     fn suggested_action_is_keep_one() {
-        let groups = build(vec![dup(0x01, 100, vec!["/a/x.txt", "/a/y.txt"])]);
+        let groups = build(vec![dup(0x01, 100, vec!["/a/x.txt", "/a/y.txt"])], vec![]);
         match &groups[0].suggested {
             Action::KeepOne { keep, trash } => {
                 assert_eq!(keep, &PathBuf::from("/a/x.txt"));
@@ -97,14 +121,14 @@ mod tests {
     fn sorted_by_reclaimable_desc() {
         let small = dup(0x01, 10, vec!["/a/s1", "/a/s2"]); // reclaim 10
         let big = dup(0x02, 1000, vec!["/a/b1", "/a/b2"]); // reclaim 1000
-        let groups = build(vec![small, big]);
+        let groups = build(vec![small, big], vec![]);
         assert_eq!(groups[0].label, format!("hash:{}", "02".repeat(6)));
         assert!(reclaimable_bytes(&groups[0]) > reclaimable_bytes(&groups[1]));
     }
 
     #[test]
     fn reclaimable_counts_trash_only() {
-        let groups = build(vec![dup(0x01, 100, vec!["/a", "/b", "/c"])]);
+        let groups = build(vec![dup(0x01, 100, vec!["/a", "/b", "/c"])], vec![]);
         // 3 files, keep 1, trash 2 → reclaim = 200
         assert_eq!(reclaimable_bytes(&groups[0]), 200);
     }
