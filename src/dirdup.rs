@@ -69,14 +69,13 @@ pub fn find_duplicate_dirs(
     let mut files_per_candidate: HashMap<PathBuf, Vec<(PathBuf, &FileEntry)>> = HashMap::new();
     for entry in entries {
         for ancestor in ancestors_up_to(&entry.path, root) {
-            if candidates.contains(&ancestor) {
-                if let Ok(rel) = entry.path.strip_prefix(&ancestor) {
+            if candidates.contains(&ancestor)
+                && let Ok(rel) = entry.path.strip_prefix(&ancestor) {
                     files_per_candidate
                         .entry(ancestor.clone())
                         .or_default()
                         .push((rel.to_path_buf(), entry));
                 }
-            }
         }
     }
 
@@ -130,7 +129,7 @@ pub fn find_duplicate_dirs(
     groups = drop_nested_duplicates(groups);
 
     // 6. Sort by reclaimable bytes desc.
-    groups.sort_by(|a, b| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.reclaimable_bytes()));
     Ok(groups)
 }
 

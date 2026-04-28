@@ -1,5 +1,4 @@
 use crate::plan::{Action, Group, GroupKind, Plan};
-use crate::report;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -127,9 +126,15 @@ pub struct App {
 
 impl App {
     pub fn new(groups: Vec<Group>, execute_allowed: bool) -> Self {
-        let mut rows_dup = Vec::new();
-        let mut rows_cluster = Vec::new();
-        let mut rows_dir = Vec::new();
+        let mut app = Self::empty_scanning_with(execute_allowed, Settings::default());
+        app.apply_progress(Progress::Done(groups));
+        app
+    }
+
+    fn install_groups(&mut self, groups: Vec<Group>) {
+        self.rows_dup.clear();
+        self.rows_cluster.clear();
+        self.rows_dir.clear();
         for (i, g) in groups.iter().enumerate() {
             let row = Row {
                 group_idx: i,
@@ -138,30 +143,12 @@ impl App {
                 file_cursor: keeper_index(g),
             };
             match g.kind {
-                GroupKind::Duplicate => rows_dup.push(row),
-                GroupKind::NameCluster => rows_cluster.push(row),
-                GroupKind::DuplicateDir => rows_dir.push(row),
+                GroupKind::Duplicate => self.rows_dup.push(row),
+                GroupKind::NameCluster => self.rows_cluster.push(row),
+                GroupKind::DuplicateDir => self.rows_dir.push(row),
             }
         }
-        Self {
-            groups,
-            rows_dup,
-            rows_cluster,
-            rows_dir,
-            tab: Tab::Duplicates,
-            selected_dup: 0,
-            selected_cluster: 0,
-            selected_dir: 0,
-            execute_allowed,
-            confirm_execute: false,
-            mode: Mode::Browsing,
-            current_settings: Settings::default(),
-            pending_rescan: None,
-        }
-    }
-
-    pub fn empty_scanning(execute_allowed: bool) -> Self {
-        Self::empty_scanning_with(execute_allowed, Settings::default())
+        self.groups = groups;
     }
 
     pub fn empty_scanning_with(execute_allowed: bool, settings: Settings) -> Self {
@@ -198,23 +185,7 @@ impl App {
                 s.hash_total = total;
             }
             (Mode::Scanning(_), Progress::Done(groups)) => {
-                self.groups = groups;
-                self.rows_dup.clear();
-                self.rows_cluster.clear();
-                self.rows_dir.clear();
-                for (i, g) in self.groups.iter().enumerate() {
-                    let row = Row {
-                        group_idx: i,
-                        chosen: g.suggested.clone(),
-                        expanded: false,
-                        file_cursor: keeper_index(g),
-                    };
-                    match g.kind {
-                        GroupKind::Duplicate => self.rows_dup.push(row),
-                        GroupKind::NameCluster => self.rows_cluster.push(row),
-                        GroupKind::DuplicateDir => self.rows_dir.push(row),
-                    }
-                }
+                self.install_groups(groups);
                 self.mode = Mode::Browsing;
             }
             (Mode::Scanning(s), Progress::Error(e)) => {
@@ -392,20 +363,18 @@ impl App {
                 let i = self.selected();
                 let group_idx = self.rows().get(i).map(|r| r.group_idx);
                 let n = group_idx.map(|gi| self.groups[gi].files.len()).unwrap_or(0);
-                if let Some(row) = self.rows_mut().get_mut(i) {
-                    if row.expanded && n > 0 {
+                if let Some(row) = self.rows_mut().get_mut(i)
+                    && row.expanded && n > 0 {
                         row.file_cursor = (row.file_cursor + 1).min(n - 1);
                     }
-                }
                 None
             }
             (KeyCode::Char('K'), _) => {
                 let i = self.selected();
-                if let Some(row) = self.rows_mut().get_mut(i) {
-                    if row.expanded && row.file_cursor > 0 {
+                if let Some(row) = self.rows_mut().get_mut(i)
+                    && row.expanded && row.file_cursor > 0 {
                         row.file_cursor -= 1;
                     }
-                }
                 None
             }
             (KeyCode::Char('m'), _) => {
@@ -591,13 +560,11 @@ where
             app.apply_progress(p);
         }
         terminal.draw(|f| draw(f, &app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if let Some(out) = app.handle_key(key) {
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+                && let Some(out) = app.handle_key(key) {
                     break out;
                 }
-            }
-        }
     };
 
     disable_raw_mode()?;
@@ -1032,14 +999,14 @@ mod tests {
 
     #[test]
     fn scanning_app_starts_empty() {
-        let app = App::empty_scanning(false);
+        let app = App::empty_scanning_with(false, Settings::default());
         assert!(app.is_scanning());
         assert!(app.groups.is_empty());
     }
 
     #[test]
     fn progress_updates_scan_state() {
-        let mut app = App::empty_scanning(false);
+        let mut app = App::empty_scanning_with(false, Settings::default());
         app.apply_progress(Progress::Walked(42));
         app.apply_progress(Progress::HashStart { total: 10 });
         app.apply_progress(Progress::Hashed { done: 5, total: 10 });
@@ -1055,7 +1022,7 @@ mod tests {
 
     #[test]
     fn done_transitions_to_browsing() {
-        let mut app = App::empty_scanning(false);
+        let mut app = App::empty_scanning_with(false, Settings::default());
         let g = dup_group("h:1", vec!["/a", "/b"], 100);
         app.apply_progress(Progress::Done(vec![g]));
         assert!(matches!(app.mode, Mode::Browsing));
@@ -1064,14 +1031,14 @@ mod tests {
 
     #[test]
     fn q_during_scan_quits() {
-        let mut app = App::empty_scanning(false);
+        let mut app = App::empty_scanning_with(false, Settings::default());
         let out = app.handle_key(key('q'));
         assert_eq!(out, Some(UiOutcome::Quit));
     }
 
     #[test]
     fn other_keys_during_scan_ignored() {
-        let mut app = App::empty_scanning(false);
+        let mut app = App::empty_scanning_with(false, Settings::default());
         assert_eq!(app.handle_key(key('a')), None);
         assert_eq!(app.handle_key(key('w')), None);
     }
@@ -1229,9 +1196,4 @@ mod tests {
         assert_eq!(pending.min_size, 8192);
     }
 
-    // Suppress dead-code warning on report import in non-test build.
-    #[allow(dead_code)]
-    fn _use_report() {
-        let _ = report::reclaimable_bytes;
-    }
 }

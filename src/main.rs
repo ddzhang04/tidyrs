@@ -1,9 +1,10 @@
-use tidyrs::{actions, cache, dedup, dirdup, plan, report, ui, walker};
+use tidyrs::{actions, cache, dedup, dirdup, report, ui, walker};
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 #[derive(Parser, Debug)]
 #[command(name = "tidy", version, about = "Local-first file organizer")]
@@ -79,48 +80,38 @@ fn spawn_scan(
 ) -> std::sync::mpsc::Receiver<ui::Progress> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let walk_tx = tx.clone();
-        let entries = match walker::walk_with(&opts, |n| {
-            let _ = walk_tx.send(ui::Progress::Walked(n));
-        }) {
-            Ok(e) => e,
-            Err(e) => {
-                let _ = tx.send(ui::Progress::Error(e.to_string()));
-                return;
-            }
-        };
-        let cache_ref = cache.as_deref();
-        let hash_tx = tx.clone();
-        let mut started = false;
-        let dups = match dedup::find_duplicates_with(&entries, cache_ref, |done, total| {
-            if !started {
-                let _ = hash_tx.send(ui::Progress::HashStart { total });
-                started = true;
-            }
-            let _ = hash_tx.send(ui::Progress::Hashed { done, total });
-        }) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(ui::Progress::Error(e.to_string()));
-                return;
-            }
-        };
-        let dir_dups = match dirdup::find_duplicate_dirs(&opts.root, &entries, cache_ref) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(ui::Progress::Error(e.to_string()));
-                return;
-            }
-        };
-        let groups = report::build(dups, dir_dups);
-        let _ = tx.send(ui::Progress::Done(groups));
+        if let Err(e) = scan_pipeline(&opts, cache.as_deref(), &tx) {
+            let _ = tx.send(ui::Progress::Error(e.to_string()));
+        }
     });
     rx
 }
 
-fn run_plain(root: &PathBuf) -> Result<()> {
+fn scan_pipeline(
+    opts: &walker::WalkOpts,
+    cache: Option<&cache::Cache>,
+    tx: &Sender<ui::Progress>,
+) -> Result<()> {
+    let entries = walker::walk_with(opts, |n| {
+        let _ = tx.send(ui::Progress::Walked(n));
+    })?;
+    let mut started = false;
+    let dups = dedup::find_duplicates_with(&entries, cache, |done, total| {
+        if !started {
+            let _ = tx.send(ui::Progress::HashStart { total });
+            started = true;
+        }
+        let _ = tx.send(ui::Progress::Hashed { done, total });
+    })?;
+    let dir_dups = dirdup::find_duplicate_dirs(&opts.root, &entries, cache)?;
+    let groups = report::build(dups, dir_dups);
+    let _ = tx.send(ui::Progress::Done(groups));
+    Ok(())
+}
+
+fn run_plain(root: &Path) -> Result<()> {
     let opts = walker::WalkOpts {
-        root: root.clone(),
+        root: root.to_path_buf(),
         ..Default::default()
     };
     let entries = walker::walk(&opts)?;

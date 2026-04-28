@@ -1,5 +1,5 @@
 use crate::plan::{Action, Plan};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -174,7 +174,7 @@ fn format_timestamp(secs: i64) -> String {
 }
 
 fn days_to_ymd(days_since_epoch: i64) -> (i32, u32, u32) {
-    let mut z = days_since_epoch + 719468;
+    let z = days_since_epoch + 719468;
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -246,13 +246,6 @@ pub fn load_undo_log(path: &Path) -> Result<UndoLog> {
         .with_context(|| format!("read {}", path.display()))?;
     let log: UndoLog = serde_json::from_str(&s)?;
     Ok(log)
-}
-
-pub fn ensure_no_op(plan: &Plan) -> Result<()> {
-    if !plan.dry_run {
-        bail!("expected dry-run plan");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -399,9 +392,4 @@ mod tests {
         assert_eq!(s, "20231114-221320");
     }
 
-    #[test]
-    fn ensure_no_op_rejects_execute() {
-        let p = Plan { dry_run: false, actions: vec![] };
-        assert!(ensure_no_op(&p).is_err());
-    }
 }

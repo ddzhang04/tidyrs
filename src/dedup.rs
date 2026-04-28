@@ -71,7 +71,7 @@ pub fn find_duplicates_with(
         })
         .collect();
 
-    groups.sort_by(|a, b| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.reclaimable_bytes()));
     Ok(groups)
 }
 
@@ -81,11 +81,10 @@ pub(crate) fn hash_with_cache(entry: &FileEntry, cache: Option<&Cache>) -> Resul
         size: entry.size,
         mtime: entry.mtime,
     };
-    if let Some(c) = cache {
-        if let Some(h) = c.get(key)? {
+    if let Some(c) = cache
+        && let Some(h) = c.get(key)? {
             return Ok(h);
         }
-    }
     let h = hash_file(&entry.path)?;
     if let Some(c) = cache {
         c.put(key, h)?;

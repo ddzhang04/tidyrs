@@ -39,15 +39,6 @@ impl Cache {
         Ok(Self { db })
     }
 
-    pub fn rebuild() -> Result<Self> {
-        let path = default_cache_path()?;
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("remove cache {}", path.display()))?;
-        }
-        Self::open_at(&path)
-    }
-
     pub fn get(&self, key: Key) -> Result<Option<[u8; 32]>> {
         let rtx = self.db.begin_read()?;
         let table = rtx.open_table(TABLE)?;
