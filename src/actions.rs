@@ -52,7 +52,7 @@ pub fn execute(plan: &Plan) -> Result<UndoLog> {
 fn execute_action(action: &Action, log: &mut UndoLog) -> Result<()> {
     match action {
         Action::Ignore => Ok(()),
-        Action::KeepOne { keep: _, trash } => {
+        Action::KeepOne { keep: _, trash } | Action::DeleteAll { trash } => {
             for path in trash {
                 let mtime = mtime_of(path).unwrap_or(0);
                 trash::delete(path)

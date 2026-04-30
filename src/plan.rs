@@ -29,6 +29,9 @@ pub enum Action {
         keep: PathBuf,
         trash: Vec<PathBuf>,
     },
+    DeleteAll {
+        trash: Vec<PathBuf>,
+    },
     FoldIntoFolder {
         folder_name: String,
         files: Vec<PathBuf>,

@@ -176,11 +176,13 @@ mod tests {
         write(&d, ".git/config", b"[core].........");
         write(&d, "real.txt", b"hello.........");
         let mut o = opts(&d);
+
         o.include_hidden = true;
         let entries = walk(&o).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].path.ends_with("real.txt"));
     }
+
 
     #[test]
     fn respects_nested_gitignore_outside_git_repo() {

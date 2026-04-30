@@ -117,6 +117,9 @@ pub struct App {
     selected_dup: usize,
     selected_cluster: usize,
     selected_dir: usize,
+    /// Whether the cursor is "inside" the expanded group's file list.
+    /// Reset to false when leaving the group, switching tabs, or collapsing.
+    cursor_on_file: bool,
     execute_allowed: bool,
     confirm_execute: bool,
     mode: Mode,
@@ -161,6 +164,7 @@ impl App {
             selected_dup: 0,
             selected_cluster: 0,
             selected_dir: 0,
+            cursor_on_file: false,
             execute_allowed,
             confirm_execute: false,
             mode: Mode::Scanning(ScanState::default()),
@@ -259,7 +263,7 @@ impl App {
         {
             match &row.chosen {
                 Action::Ignore => {}
-                Action::KeepOne { trash, .. } => {
+                Action::KeepOne { trash, .. } | Action::DeleteAll { trash } => {
                     groups_selected += 1;
                     files_affected += trash.len();
                     let g = &self.groups[row.group_idx];
@@ -309,82 +313,28 @@ impl App {
                     Tab::Clusters => Tab::Directories,
                     Tab::Directories => Tab::Duplicates,
                 };
+                self.cursor_on_file = false;
                 None
             }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                let len = self.rows().len();
-                if len > 0 {
-                    let s = self.selected_mut();
-                    *s = (*s + 1).min(len - 1);
-                }
+            (KeyCode::Down, _) => {
+                self.move_down();
                 None
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                let s = self.selected_mut();
-                if *s > 0 {
-                    *s -= 1;
-                }
+            (KeyCode::Up, _) => {
+                self.move_up();
                 None
             }
             (KeyCode::Enter, _) => {
-                let i = self.selected();
-                if let Some(row) = self.rows_mut().get_mut(i) {
-                    row.expanded = !row.expanded;
-                }
+                self.handle_enter();
                 None
             }
-            (KeyCode::Char('a'), _) => {
+            (KeyCode::Char('d'), _) => {
                 let i = self.selected();
                 let group_idx = self.rows().get(i).map(|r| r.group_idx);
                 if let Some(gi) = group_idx {
                     let suggested = self.groups[gi].suggested.clone();
                     if let Some(row) = self.rows_mut().get_mut(i) {
-                        row.chosen = cycle_action(&row.chosen, &suggested);
-                    }
-                }
-                None
-            }
-            (KeyCode::Char(' '), _) => {
-                let i = self.selected();
-                let group_idx = self.rows().get(i).map(|r| r.group_idx);
-                if let Some(gi) = group_idx {
-                    let suggested = self.groups[gi].suggested.clone();
-                    if let Some(row) = self.rows_mut().get_mut(i) {
-                        row.chosen = if matches!(row.chosen, Action::Ignore) {
-                            suggested
-                        } else {
-                            Action::Ignore
-                        };
-                    }
-                }
-                None
-            }
-            (KeyCode::Char('J'), _) => {
-                let i = self.selected();
-                let group_idx = self.rows().get(i).map(|r| r.group_idx);
-                let n = group_idx.map(|gi| self.groups[gi].files.len()).unwrap_or(0);
-                if let Some(row) = self.rows_mut().get_mut(i)
-                    && row.expanded && n > 0 {
-                        row.file_cursor = (row.file_cursor + 1).min(n - 1);
-                    }
-                None
-            }
-            (KeyCode::Char('K'), _) => {
-                let i = self.selected();
-                if let Some(row) = self.rows_mut().get_mut(i)
-                    && row.expanded && row.file_cursor > 0 {
-                        row.file_cursor -= 1;
-                    }
-                None
-            }
-            (KeyCode::Char('m'), _) => {
-                let i = self.selected();
-                let group_idx = self.rows().get(i).map(|r| r.group_idx);
-                if let Some(gi) = group_idx {
-                    let cursor = self.rows().get(i).map(|r| r.file_cursor).unwrap_or(0);
-                    let new_action = rebuild_keep_one(&self.groups[gi], cursor);
-                    if let Some(row) = self.rows_mut().get_mut(i) {
-                        row.chosen = new_action;
+                        row.chosen = cycle_group_action(&row.chosen, &suggested);
                     }
                 }
                 None
@@ -393,8 +343,16 @@ impl App {
                 let i = self.selected();
                 if let Some(row) = self.rows().get(i) {
                     let group = &self.groups[row.group_idx];
-                    if let Some(file) = group.files.get(row.file_cursor) {
-                        let _ = open_in_system(&file.path);
+                    let path = if self.cursor_on_file && row.expanded {
+                        group.files.get(row.file_cursor).map(|f| f.path.clone())
+                    } else {
+                        match &row.chosen {
+                            Action::KeepOne { keep, .. } => Some(keep.clone()),
+                            _ => group.files.first().map(|f| f.path.clone()),
+                        }
+                    };
+                    if let Some(p) = path {
+                        let _ = open_in_system(&p);
                     }
                 }
                 None
@@ -411,6 +369,85 @@ impl App {
                 None
             }
             _ => None,
+        }
+    }
+
+    fn move_down(&mut self) {
+        let i = self.selected();
+        let row = match self.rows().get(i) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let n_files = self.groups[row.group_idx].files.len();
+        let n_rows = self.rows().len();
+
+        if row.expanded && self.cursor_on_file {
+            // inside file list: move down within files, or out to next group
+            if row.file_cursor + 1 < n_files {
+                self.rows_mut()[i].file_cursor += 1;
+            } else if i + 1 < n_rows {
+                self.cursor_on_file = false;
+                *self.selected_mut() = i + 1;
+            }
+        } else if row.expanded {
+            // on header of expanded group: descend into its files
+            self.cursor_on_file = true;
+            self.rows_mut()[i].file_cursor = 0;
+        } else if i + 1 < n_rows {
+            *self.selected_mut() = i + 1;
+        }
+    }
+
+    fn move_up(&mut self) {
+        let i = self.selected();
+        let row = match self.rows().get(i) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        if row.expanded && self.cursor_on_file {
+            if row.file_cursor > 0 {
+                self.rows_mut()[i].file_cursor -= 1;
+            } else {
+                // exit out the top of the file list to the group header
+                self.cursor_on_file = false;
+            }
+        } else if i > 0 {
+            // move up to previous group; if it's expanded, land on its last file
+            let prev = i - 1;
+            *self.selected_mut() = prev;
+            let prev_row = self.rows()[prev].clone();
+            if prev_row.expanded {
+                let n = self.groups[prev_row.group_idx].files.len();
+                self.cursor_on_file = true;
+                if n > 0 {
+                    self.rows_mut()[prev].file_cursor = n - 1;
+                }
+            } else {
+                self.cursor_on_file = false;
+            }
+        }
+    }
+
+    fn handle_enter(&mut self) {
+        let i = self.selected();
+        let row = match self.rows().get(i) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        if self.cursor_on_file && row.expanded {
+            // mark the focused file as the keeper
+            let group = &self.groups[row.group_idx];
+            let new_action = rebuild_keep_one(group, row.file_cursor);
+            self.rows_mut()[i].chosen = new_action;
+        } else {
+            // toggle expansion on the group header
+            let now_expanded = !row.expanded;
+            self.rows_mut()[i].expanded = now_expanded;
+            if !now_expanded {
+                self.cursor_on_file = false;
+            }
         }
     }
 
@@ -507,6 +544,22 @@ fn rebuild_keep_one(group: &Group, keeper_idx: usize) -> Action {
     Action::KeepOne { keep, trash }
 }
 
+/// Cycles a duplicate group through three states:
+/// KeepOne → DeleteAll → Ignore → KeepOne (restores `suggested`).
+/// Going to DeleteAll absorbs the previous keeper into the trash list.
+fn cycle_group_action(current: &Action, suggested: &Action) -> Action {
+    match current {
+        Action::KeepOne { keep, trash } => {
+            let mut all = trash.clone();
+            all.push(keep.clone());
+            Action::DeleteAll { trash: all }
+        }
+        Action::DeleteAll { .. } => Action::Ignore,
+        Action::Ignore => suggested.clone(),
+        Action::FoldIntoFolder { .. } => Action::Ignore,
+    }
+}
+
 fn open_in_system(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let cmd = "open";
@@ -515,14 +568,6 @@ fn open_in_system(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let cmd = "open";
     std::process::Command::new(cmd).arg(path).spawn().map(|_| ())
-}
-
-fn cycle_action(current: &Action, suggested: &Action) -> Action {
-    match (current, suggested) {
-        (Action::KeepOne { .. }, _) => Action::Ignore,
-        (Action::FoldIntoFolder { .. }, _) => Action::Ignore,
-        (Action::Ignore, s) => s.clone(),
-    }
 }
 
 pub fn run_with_factory<F>(
@@ -610,9 +655,18 @@ fn draw_browsing(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(tabs, chunks[0]);
 
     let rows = app.rows();
+    let selected_idx = app.selected();
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| group_list_item(row, &app.groups[row.group_idx]))
+        .enumerate()
+        .map(|(i, row)| {
+            let focused_file_idx = if i == selected_idx && app.cursor_on_file && row.expanded {
+                Some(row.file_cursor)
+            } else {
+                None
+            };
+            group_list_item(row, &app.groups[row.group_idx], focused_file_idx)
+        })
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("groups"))
@@ -626,7 +680,7 @@ fn draw_browsing(f: &mut ratatui::Frame, app: &App) {
     let (groups_sel, files_aff, bytes) = app.totals();
     let mode = if app.execute_allowed { "execute" } else { "dry-run" };
     let status = format!(
-        " {} groups • {} files • {:.2} MB reclaimable │ mode: {} │ Tab=switch ↑↓=group J/K=file m=keep o=open a=cycle Space=ignore s=settings w=save x=execute q=quit",
+        " {} groups • {} files • {:.2} MB reclaimable │ mode: {} │ ↑↓ navigate · Enter expand/keep · d cycle del/del-all/skip · o open · s settings · w save · x execute · Tab tabs · q quit",
         groups_sel,
         files_aff,
         bytes as f64 / 1_000_000.0,
@@ -691,18 +745,23 @@ fn draw_failed(f: &mut ratatui::Frame, msg: &str) {
     f.render_widget(p, area);
 }
 
-fn group_list_item<'a>(row: &'a Row, group: &'a Group) -> ListItem<'a> {
+fn group_list_item<'a>(
+    row: &'a Row,
+    group: &'a Group,
+    focused_file_idx: Option<usize>,
+) -> ListItem<'a> {
     let marker = match &row.chosen {
         Action::KeepOne { .. } => "[del]",
+        Action::DeleteAll { .. } => "[del all]",
         Action::FoldIntoFolder { .. } => "[fold]",
         Action::Ignore => "[skip]",
     };
     let unit = group.files.first().map(|f| f.size).unwrap_or(0);
     let header = Line::from(vec![
         Span::styled(
-            format!("{:6} ", marker),
+            format!("{:8} ", marker),
             Style::default().fg(match &row.chosen {
-                Action::KeepOne { .. } => Color::Red,
+                Action::KeepOne { .. } | Action::DeleteAll { .. } => Color::Red,
                 Action::FoldIntoFolder { .. } => Color::Cyan,
                 Action::Ignore => Color::DarkGray,
             }),
@@ -716,23 +775,35 @@ fn group_list_item<'a>(row: &'a Row, group: &'a Group) -> ListItem<'a> {
     ]);
     let mut lines = vec![header];
     if row.expanded {
+        let is_skipped = matches!(row.chosen, Action::Ignore);
+        let is_delete_all = matches!(row.chosen, Action::DeleteAll { .. });
         let keep_path = match &row.chosen {
             Action::KeepOne { keep, .. } => Some(keep.clone()),
             _ => None,
         };
         for (i, f) in group.files.iter().enumerate() {
             let is_keep = keep_path.as_ref().map(|k| k == &f.path).unwrap_or(false);
-            let is_focused = i == row.file_cursor;
-            let prefix = match (is_focused, is_keep) {
-                (true, true) => "  ▶ keep ",
-                (true, false) => "  ▶ del  ",
-                (false, true) => "    keep ",
-                (false, false) => "    del  ",
+            let is_focused = focused_file_idx == Some(i);
+            let label = if is_skipped {
+                "skip"
+            } else if is_keep {
+                "keep"
+            } else {
+                "del "
+            };
+            let prefix = if is_focused {
+                format!("  ▶ {label} ")
+            } else {
+                format!("    {label} ")
             };
             let style = if is_focused {
                 Style::default().add_modifier(Modifier::REVERSED)
+            } else if is_skipped {
+                Style::default().fg(Color::DarkGray)
             } else if is_keep {
                 Style::default().fg(Color::Green)
+            } else if is_delete_all {
+                Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -864,21 +935,130 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_ignore() {
+    fn d_cycles_keep_one_delete_all_ignore() {
         let mut app = App::new(vec![dup_group("h:1", vec!["/a", "/b"], 100)], false);
-        app.handle_key(key(' '));
+        // Default: KeepOne
+        assert!(matches!(app.rows_dup[0].chosen, Action::KeepOne { .. }));
+        // 1st d: KeepOne → DeleteAll
+        app.handle_key(key('d'));
+        match &app.rows_dup[0].chosen {
+            Action::DeleteAll { trash } => assert_eq!(trash.len(), 2),
+            other => panic!("expected DeleteAll, got {other:?}"),
+        }
+        // 2nd d: DeleteAll → Ignore
+        app.handle_key(key('d'));
         assert!(matches!(app.rows_dup[0].chosen, Action::Ignore));
-        app.handle_key(key(' '));
+        // 3rd d: Ignore → back to default KeepOne
+        app.handle_key(key('d'));
         assert!(matches!(app.rows_dup[0].chosen, Action::KeepOne { .. }));
     }
 
     #[test]
-    fn a_cycles_actions() {
-        let mut app = App::new(vec![dup_group("h:1", vec!["/a", "/b"], 100)], false);
-        app.handle_key(key('a'));
-        assert!(matches!(app.rows_dup[0].chosen, Action::Ignore));
-        app.handle_key(key('a'));
-        assert!(matches!(app.rows_dup[0].chosen, Action::KeepOne { .. }));
+    fn delete_all_totals_counts_every_file() {
+        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('d')); // → DeleteAll
+        let (groups, files, bytes) = app.totals();
+        assert_eq!(groups, 1);
+        assert_eq!(files, 3);
+        assert_eq!(bytes, 300);
+    }
+
+    #[test]
+    fn enter_on_file_recovers_from_delete_all() {
+        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(key('d')); // → DeleteAll
+        app.handle_key(special(KeyCode::Enter)); // expand
+        app.handle_key(special(KeyCode::Down)); // file 0
+        app.handle_key(special(KeyCode::Down)); // file 1 (=/b)
+        app.handle_key(special(KeyCode::Enter)); // mark /b as keeper
+        match &app.rows_dup[0].chosen {
+            Action::KeepOne { keep, trash } => {
+                assert_eq!(keep, &PathBuf::from("/b"));
+                assert_eq!(trash.len(), 2);
+            }
+            other => panic!("expected KeepOne, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn down_into_expanded_group_steps_through_files() {
+        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
+        let mut app = App::new(vec![g], false);
+        // expand
+        app.handle_key(special(KeyCode::Enter));
+        assert!(!app.cursor_on_file);
+        // ↓ from header → enters file list at index 0
+        app.handle_key(special(KeyCode::Down));
+        assert!(app.cursor_on_file);
+        assert_eq!(app.rows_dup[0].file_cursor, 0);
+        // ↓ → file 1
+        app.handle_key(special(KeyCode::Down));
+        assert_eq!(app.rows_dup[0].file_cursor, 1);
+        // ↓ → file 2
+        app.handle_key(special(KeyCode::Down));
+        assert_eq!(app.rows_dup[0].file_cursor, 2);
+        // ↓ at last file with no next group → no-op
+        app.handle_key(special(KeyCode::Down));
+        assert_eq!(app.rows_dup[0].file_cursor, 2);
+    }
+
+    #[test]
+    fn down_at_last_file_jumps_to_next_group() {
+        let groups = vec![
+            dup_group("h:1", vec!["/a", "/b"], 100),
+            dup_group("h:2", vec!["/c", "/d"], 100),
+        ];
+        let mut app = App::new(groups, false);
+        app.handle_key(special(KeyCode::Enter)); // expand group 0
+        app.handle_key(special(KeyCode::Down)); // file 0
+        app.handle_key(special(KeyCode::Down)); // file 1 (last)
+        app.handle_key(special(KeyCode::Down)); // jump to group 1
+        assert_eq!(app.selected(), 1);
+        assert!(!app.cursor_on_file);
+    }
+
+    #[test]
+    fn up_at_first_file_returns_to_group_header() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(special(KeyCode::Enter)); // expand
+        app.handle_key(special(KeyCode::Down)); // into file 0
+        assert!(app.cursor_on_file);
+        app.handle_key(special(KeyCode::Up)); // back to header
+        assert!(!app.cursor_on_file);
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn enter_on_file_marks_keeper() {
+        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(special(KeyCode::Enter)); // expand
+        app.handle_key(special(KeyCode::Down)); // file 0
+        app.handle_key(special(KeyCode::Down)); // file 1 (=/b)
+        app.handle_key(special(KeyCode::Enter)); // mark /b as keeper
+        match &app.rows_dup[0].chosen {
+            Action::KeepOne { keep, trash } => {
+                assert_eq!(keep, &PathBuf::from("/b"));
+                assert_eq!(trash.len(), 2);
+                assert!(trash.contains(&PathBuf::from("/a")));
+                assert!(trash.contains(&PathBuf::from("/c")));
+            }
+            other => panic!("expected KeepOne, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_resets_cursor_on_file() {
+        let g = dup_group("h:1", vec!["/a", "/b"], 100);
+        let mut app = App::new(vec![g], false);
+        app.handle_key(special(KeyCode::Enter));
+        app.handle_key(special(KeyCode::Down));
+        assert!(app.cursor_on_file);
+        app.handle_key(special(KeyCode::Tab));
+        assert!(!app.cursor_on_file);
     }
 
     #[test]
@@ -973,7 +1153,9 @@ mod tests {
         ];
         let mut app = App::new(groups, false);
         app.handle_key(special(KeyCode::Down));
-        app.handle_key(key(' '));
+        // cycle 2nd group to Ignore: KeepOne → DeleteAll → Ignore
+        app.handle_key(key('d'));
+        app.handle_key(key('d'));
         let plan = app.build_plan(true);
         assert_eq!(plan.actions.len(), 1);
     }
@@ -990,7 +1172,9 @@ mod tests {
         assert_eq!(f, 2);
         assert_eq!(b, 300);
 
-        app.handle_key(key(' ')); // ignore first
+        // cycle first group to Ignore
+        app.handle_key(key('d'));
+        app.handle_key(key('d'));
         let (g, f, b) = app.totals();
         assert_eq!(g, 1);
         assert_eq!(f, 1);
@@ -1041,71 +1225,6 @@ mod tests {
         let mut app = App::empty_scanning_with(false, Settings::default());
         assert_eq!(app.handle_key(key('a')), None);
         assert_eq!(app.handle_key(key('w')), None);
-    }
-
-    #[test]
-    fn file_cursor_defaults_to_keeper() {
-        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
-        let app = App::new(vec![g], false);
-        // keeper is /a (index 0)
-        assert_eq!(app.rows_dup[0].file_cursor, 0);
-    }
-
-    #[test]
-    fn shift_j_k_moves_file_cursor_when_expanded() {
-        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
-        let mut app = App::new(vec![g], false);
-        app.handle_key(special(KeyCode::Enter)); // expand
-        assert!(app.rows_dup[0].expanded);
-        app.handle_key(key('J'));
-        assert_eq!(app.rows_dup[0].file_cursor, 1);
-        app.handle_key(key('J'));
-        assert_eq!(app.rows_dup[0].file_cursor, 2);
-        app.handle_key(key('J')); // clamp
-        assert_eq!(app.rows_dup[0].file_cursor, 2);
-        app.handle_key(key('K'));
-        assert_eq!(app.rows_dup[0].file_cursor, 1);
-    }
-
-    #[test]
-    fn file_cursor_inert_when_collapsed() {
-        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
-        let mut app = App::new(vec![g], false);
-        app.handle_key(key('J'));
-        assert_eq!(app.rows_dup[0].file_cursor, 0);
-    }
-
-    #[test]
-    fn m_marks_focused_file_as_keeper() {
-        let g = dup_group("h:1", vec!["/a", "/b", "/c"], 100);
-        let mut app = App::new(vec![g], false);
-        app.handle_key(special(KeyCode::Enter));
-        app.handle_key(key('J')); // cursor on /b
-        app.handle_key(key('m'));
-        match &app.rows_dup[0].chosen {
-            Action::KeepOne { keep, trash } => {
-                assert_eq!(keep, &PathBuf::from("/b"));
-                assert_eq!(trash.len(), 2);
-                assert!(trash.contains(&PathBuf::from("/a")));
-                assert!(trash.contains(&PathBuf::from("/c")));
-            }
-            other => panic!("expected KeepOne, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn m_recovers_from_ignore() {
-        let g = dup_group("h:1", vec!["/a", "/b"], 100);
-        let mut app = App::new(vec![g], false);
-        app.handle_key(key(' ')); // ignore
-        assert!(matches!(app.rows_dup[0].chosen, Action::Ignore));
-        app.handle_key(special(KeyCode::Enter));
-        app.handle_key(key('J')); // cursor on /b
-        app.handle_key(key('m'));
-        match &app.rows_dup[0].chosen {
-            Action::KeepOne { keep, .. } => assert_eq!(keep, &PathBuf::from("/b")),
-            _ => panic!("expected KeepOne after m"),
-        }
     }
 
     #[test]

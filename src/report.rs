@@ -62,11 +62,9 @@ fn short_hash(hash: &[u8; 32]) -> String {
 }
 
 pub fn reclaimable_bytes(g: &Group) -> u64 {
+    let unit = g.files.first().map(|f| f.size).unwrap_or(0);
     match &g.suggested {
-        Action::KeepOne { trash, .. } => {
-            let unit = g.files.first().map(|f| f.size).unwrap_or(0);
-            unit * trash.len() as u64
-        }
+        Action::KeepOne { trash, .. } | Action::DeleteAll { trash } => unit * trash.len() as u64,
         Action::FoldIntoFolder { .. } | Action::Ignore => 0,
     }
 }
